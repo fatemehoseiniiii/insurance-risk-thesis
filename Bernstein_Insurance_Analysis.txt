@@ -1,0 +1,3688 @@
+###############
+###############################################################
+###############################################################
+##
+##  REAL INSURANCE DATA
+##  MARGINAL FITTING + BERNSTEIN COPULA
+##
+##  Variables:
+##    X1 = atashsoozi
+##    X2 = mohandesi
+##    X3 = masoliat
+##
+###############################################################
+###############################################################
+
+
+###############################################################
+## SECTION 1
+## Required packages
+###############################################################
+
+packages <- c(
+  "readxl",
+  "forecast",
+  "flexsurv",
+  "GB2",
+  "alabama"
+)
+
+for (pkg in packages) {
+
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+
+}
+
+library(readxl)
+library(forecast)
+library(flexsurv)
+library(GB2)
+library(alabama)
+
+
+###############################################################
+## SECTION 2
+## Read the Excel data
+###############################################################
+#LossData <- read_excel(file.choose())
+
+LossData <- read_excel(
+  "Loss_Occured.xlsx",
+  sheet = "Sheet1"
+)
+
+## Name first column Year
+names(LossData)[1] <- "Year"
+
+## Keep the three insurance lines
+X <- LossData[, c(
+  "atashsoozi",
+  "mohandesi",
+  "masoliat"
+)]
+
+X <- as.data.frame(X)
+
+## Initial checks
+print(X)
+
+str(X)
+
+summary(X)
+
+sapply(
+  X,
+  function(x) sum(!is.na(x))
+)
+
+sapply(
+  X,
+  function(x) sum(x <= 0, na.rm = TRUE)
+)
+
+sapply(
+  X,
+  range,
+  na.rm = TRUE
+)
+
+###################################################
+##آزمون الجونگ باکس
+##
+####################################################
+
+Box.test(LossData$atashsoozi, lag=3 ,type="Ljung-Box")
+Box.test(LossData$mohandesi, lag=3 ,type="Ljung-Box")
+Box.test(LossData$masoliat, lag=3 ,type="Ljung-Box")
+
+
+###############################################################
+## SECTION 3
+## Distribution functions
+###############################################################
+
+
+###############################################################
+## 3.1 Lognormal
+###############################################################
+
+d_lnorm <- function(x, par, log = FALSE) {
+
+  dlnorm(
+    x,
+    meanlog = unname(par["meanlog"]),
+    sdlog   = unname(par["sdlog"]),
+    log     = log
+  )
+}
+
+
+###############################################################
+## 3.2 Gamma
+## Parameterization: shape, rate
+###############################################################
+
+d_gamma <- function(x, par, log = FALSE) {
+
+  dgamma(
+    x,
+    shape = unname(par["shape"]),
+    rate  = unname(par["rate"]),
+    log   = log
+  )
+}
+
+
+###############################################################
+## 3.3 Weibull
+###############################################################
+
+d_weibull <- function(x, par, log = FALSE) {
+
+  dweibull(
+    x,
+    shape = unname(par["shape"]),
+    scale = unname(par["scale"]),
+    log   = log
+  )
+}
+
+
+###############################################################
+## 3.4 Burr XII
+##
+## F(x) =
+## 1 - [1 + (x/scale)^c]^(-k)
+###############################################################
+
+d_burr12 <- function(x, par, log = FALSE) {
+
+  cpar  <- unname(par["c"])
+  kpar  <- unname(par["k"])
+  scale <- unname(par["scale"])
+
+  logdens <-
+    log(cpar) +
+    log(kpar) -
+    log(scale) +
+    (cpar - 1) * log(x / scale) -
+    (kpar + 1) *
+    log1p((x / scale)^cpar)
+
+  if (log) {
+    return(logdens)
+  }
+
+  exp(logdens)
+}
+
+
+###############################################################
+## 3.5 Generalized Gamma
+##
+## flexsurv parameterization:
+## mu, sigma, Q
+###############################################################
+
+d_ggamma <- function(x, par, log = FALSE) {
+
+  flexsurv::dgengamma(
+    x,
+    mu    = unname(par["mu"]),
+    sigma = unname(par["sigma"]),
+    Q     = unname(par["Q"]),
+    log   = log
+  )
+}
+
+
+###############################################################
+## 3.6 GB2
+##
+## Our notation:
+## a,b,p,q
+##
+## GB2 package:
+## shape1 = a
+## scale  = b
+## shape2 = p
+## shape3 = q
+###############################################################
+
+d_gb2 <- function(x, par, log = FALSE) {
+
+  a <- unname(par["a"])
+  b <- unname(par["b"])
+  p <- unname(par["p"])
+  q <- unname(par["q"])
+
+  dens <- GB2::dgb2(
+    x,
+    shape1 = a,
+    scale  = b,
+    shape2 = p,
+    shape3 = q
+  )
+
+  if (log) {
+    return(log(dens))
+  }
+
+  dens
+}
+
+
+###############################################################
+## SECTION 4
+## Main maximum-likelihood fitting function
+###############################################################
+
+fit_positive_distribution <- function(x, dist) {
+
+  x <- as.numeric(x)
+
+  x <- x[
+    is.finite(x) &
+    x > 0
+  ]
+
+  n <- length(x)
+
+
+  #############################################################
+  ## Lognormal
+  #############################################################
+
+  if (dist == "Lognormal") {
+
+    theta0 <- c(
+      mean(log(x)),
+      log(sd(log(x)))
+    )
+
+    objective <- function(theta) {
+
+      theta <- unname(theta)
+
+      meanlog <- theta[1]
+
+      sdlog <-
+        exp(theta[2])
+
+      ll <- dlnorm(
+        x,
+        meanlog = meanlog,
+        sdlog   = sdlog,
+        log     = TRUE
+      )
+
+      if (any(!is.finite(ll))) {
+        return(1e100)
+      }
+
+      -sum(ll)
+    }
+
+    fit <- optim(
+      par = theta0,
+      fn = objective,
+      method = "BFGS",
+      control = list(
+        maxit = 5000
+      )
+    )
+
+    par <- c(
+      meanlog =
+        unname(fit$par[1]),
+
+      sdlog =
+        exp(unname(fit$par[2]))
+    )
+  }
+
+
+  #############################################################
+  ## Gamma
+  #############################################################
+
+  if (dist == "Gamma") {
+
+    mx <- mean(x)
+
+    vx <- var(x)
+
+    shape0 <-
+      mx^2 / vx
+
+    rate0 <-
+      mx / vx
+
+    theta0 <-
+      log(
+        c(
+          shape0,
+          rate0
+        )
+      )
+
+    objective <- function(theta) {
+
+      theta <- unname(theta)
+
+      shape <-
+        exp(theta[1])
+
+      rate <-
+        exp(theta[2])
+
+      ll <- dgamma(
+        x,
+        shape = shape,
+        rate  = rate,
+        log   = TRUE
+      )
+
+      if (any(!is.finite(ll))) {
+        return(1e100)
+      }
+
+      -sum(ll)
+    }
+
+    fit <- optim(
+      par = theta0,
+      fn = objective,
+      method = "BFGS",
+      control = list(
+        maxit = 5000
+      )
+    )
+
+    par <- c(
+      shape =
+        exp(unname(fit$par[1])),
+
+      rate =
+        exp(unname(fit$par[2]))
+    )
+  }
+
+
+  #############################################################
+  ## Weibull
+  #############################################################
+
+  if (dist == "Weibull") {
+
+    theta0 <- log(
+      c(
+        1,
+        median(x)
+      )
+    )
+
+    objective <- function(theta) {
+
+      theta <- unname(theta)
+
+      shape <-
+        exp(theta[1])
+
+      scale <-
+        exp(theta[2])
+
+      ll <- suppressWarnings(
+        dweibull(
+          x,
+          shape = shape,
+          scale = scale,
+          log   = TRUE
+        )
+      )
+
+      if (any(!is.finite(ll))) {
+        return(1e100)
+      }
+
+      -sum(ll)
+    }
+
+    fit <- optim(
+      par = theta0,
+      fn = objective,
+      method = "BFGS",
+      control = list(
+        maxit = 5000
+      )
+    )
+
+    par <- c(
+      shape =
+        exp(unname(fit$par[1])),
+
+      scale =
+        exp(unname(fit$par[2]))
+    )
+  }
+
+
+  #############################################################
+  ## Burr XII
+  #############################################################
+
+  if (dist == "Burr12") {
+
+    theta0 <- log(
+      c(
+        2,
+        2,
+        median(x)
+      )
+    )
+
+    objective <- function(theta) {
+
+      theta <- unname(theta)
+
+      cpar <-
+        exp(theta[1])
+
+      kpar <-
+        exp(theta[2])
+
+      scale <-
+        exp(theta[3])
+
+      z <-
+        log(x / scale)
+
+      zz <-
+        cpar * z
+
+      ## Stable evaluation of log(1 + exp(zz))
+      log1pexp <-
+        ifelse(
+          zz > 0,
+          zz + log1p(exp(-zz)),
+          log1p(exp(zz))
+        )
+
+      ll <-
+        log(cpar) +
+        log(kpar) -
+        log(scale) +
+        (cpar - 1) * z -
+        (kpar + 1) * log1pexp
+
+      if (any(!is.finite(ll))) {
+        return(1e100)
+      }
+
+      -sum(ll)
+    }
+
+    fit <- optim(
+      par = theta0,
+      fn = objective,
+      method = "BFGS",
+      control = list(
+        maxit = 10000,
+        reltol = 1e-10
+      )
+    )
+
+    par <- c(
+      c =
+        exp(unname(fit$par[1])),
+
+      k =
+        exp(unname(fit$par[2])),
+
+      scale =
+        exp(unname(fit$par[3]))
+    )
+  }
+
+
+  #############################################################
+  ## Generalized Gamma
+  #############################################################
+
+  if (dist == "GGamma") {
+
+    theta0 <- c(
+      mean(log(x)),
+      log(sd(log(x))),
+      0.5
+    )
+
+    objective <- function(theta) {
+
+      theta <- unname(theta)
+
+      mu <-
+        theta[1]
+
+      sigma <-
+        exp(theta[2])
+
+      Q <-
+        theta[3]
+
+      ll <- flexsurv::dgengamma(
+        x,
+        mu    = mu,
+        sigma = sigma,
+        Q     = Q,
+        log   = TRUE
+      )
+
+      if (any(!is.finite(ll))) {
+        return(1e100)
+      }
+
+      -sum(ll)
+    }
+
+    fit <- optim(
+      par = theta0,
+      fn = objective,
+      method = "BFGS",
+      control = list(
+        maxit = 10000,
+        reltol = 1e-10
+      )
+    )
+
+    par <- c(
+      mu =
+        unname(fit$par[1]),
+
+      sigma =
+        exp(unname(fit$par[2])),
+
+      Q =
+        unname(fit$par[3])
+    )
+  }
+
+
+  #############################################################
+  ## GB2
+  #############################################################
+
+  if (dist == "GB2") {
+
+    theta0 <- log(
+      c(
+        2,
+        median(x),
+        1,
+        1
+      )
+    )
+
+    log1pexp <- function(z) {
+
+      ifelse(
+        z > 0,
+        z + log1p(exp(-z)),
+        log1p(exp(z))
+      )
+    }
+
+    objective <- function(theta) {
+
+      theta <-
+        unname(theta)
+
+      a <-
+        exp(theta[1])
+
+      b <-
+        exp(theta[2])
+
+      p <-
+        exp(theta[3])
+
+      q <-
+        exp(theta[4])
+
+      logxb <-
+        log(x) - log(b)
+
+      z <-
+        a * logxb
+
+      ll <-
+        log(a) -
+        log(b) -
+        lbeta(p, q) +
+        (a * p - 1) * logxb -
+        (p + q) * log1pexp(z)
+
+      if (any(!is.finite(ll))) {
+        return(1e100)
+      }
+
+      -sum(ll)
+    }
+
+    fit <- optim(
+      par = theta0,
+      fn = objective,
+      method = "BFGS",
+      control = list(
+        maxit = 20000,
+        reltol = 1e-10
+      )
+    )
+
+    par <- c(
+      a =
+        exp(unname(fit$par[1])),
+
+      b =
+        exp(unname(fit$par[2])),
+
+      p =
+        exp(unname(fit$par[3])),
+
+      q =
+        exp(unname(fit$par[4]))
+    )
+  }
+
+
+  #############################################################
+  ## Information criteria
+  #############################################################
+
+  logLik_value <-
+    -fit$value
+
+  kpar <-
+    length(par)
+
+  AIC_value <-
+    -2 * logLik_value +
+    2 * kpar
+
+  BIC_value <-
+    -2 * logLik_value +
+    log(n) * kpar
+
+
+  #############################################################
+  ## Return result
+  #############################################################
+
+  list(
+
+    distribution = dist,
+
+    par = par,
+
+    logLik =
+      logLik_value,
+
+    AIC =
+      AIC_value,
+
+    BIC =
+      BIC_value,
+
+    convergence =
+      fit$convergence,
+
+    counts =
+      fit$counts,
+
+    message =
+      fit$message
+
+  )
+}
+
+
+###############################################################
+## SECTION 5
+## Fit all six distributions
+###############################################################
+
+fit_all_distributions <- function(x) {
+
+  distributions <- c(
+    "Lognormal",
+    "Gamma",
+    "Weibull",
+    "Burr12",
+    "GGamma",
+    "GB2"
+  )
+
+  fits <- lapply(
+    distributions,
+    function(d) {
+
+      fit_positive_distribution(
+        x,
+        d
+      )
+
+    }
+  )
+
+  names(fits) <-
+    distributions
+
+  summary_table <-
+    do.call(
+      rbind,
+      lapply(
+        fits,
+        function(z) {
+
+          data.frame(
+
+            Distribution =
+              z$distribution,
+
+            LogLik =
+              z$logLik,
+
+            AIC =
+              z$AIC,
+
+            BIC =
+              z$BIC,
+
+            Convergence =
+              z$convergence
+          )
+        }
+      )
+    )
+
+  summary_table$AIC_rank <-
+    rank(
+      summary_table$AIC
+    )
+
+  summary_table$BIC_rank <-
+    rank(
+      summary_table$BIC
+    )
+
+  summary_table <-
+    summary_table[
+      order(summary_table$AIC),
+    ]
+
+  rownames(summary_table) <-
+    NULL
+
+  list(
+    fits = fits,
+    summary = summary_table
+  )
+}
+
+
+###############################################################
+## SECTION 6
+## Fit the three insurance lines
+###############################################################
+
+Fit_atashsoozi <-
+  fit_all_distributions(
+    X$atashsoozi
+  )
+
+Fit_mohandesi <-
+  fit_all_distributions(
+    X$mohandesi
+  )
+
+Fit_masoliat <-
+  fit_all_distributions(
+    X$masoliat
+  )
+
+
+###############################################################
+## SECTION 7
+## Print AIC/BIC results
+###############################################################
+
+cat(
+  "\n=============================\n"
+)
+
+cat("ATASHSOOZI\n")
+
+cat(
+  "=============================\n"
+)
+
+print(
+  Fit_atashsoozi$summary
+)
+
+
+cat(
+  "\n=============================\n"
+)
+
+cat("MOHANDESI\n")
+
+cat(
+  "=============================\n"
+)
+
+print(
+  Fit_mohandesi$summary
+)
+
+
+cat(
+  "\n=============================\n"
+)
+
+cat("MASOLIAT\n")
+
+cat(
+  "=============================\n"
+)
+
+print(
+  Fit_masoliat$summary
+)
+
+
+###############################################################
+## SECTION 8
+## CDF functions for AD test
+###############################################################
+
+cdf_fit <- function(x, fit) {
+
+  par <-
+    fit$par
+
+  dist <-
+    fit$distribution
+
+
+  if (dist == "Lognormal") {
+
+    return(
+      plnorm(
+        x,
+        meanlog =
+          unname(par["meanlog"]),
+        sdlog =
+          unname(par["sdlog"])
+      )
+    )
+  }
+
+
+  if (dist == "Gamma") {
+
+    return(
+      pgamma(
+        x,
+        shape =
+          unname(par["shape"]),
+        rate =
+          unname(par["rate"])
+      )
+    )
+  }
+
+
+  if (dist == "Weibull") {
+
+    return(
+      pweibull(
+        x,
+        shape =
+          unname(par["shape"]),
+        scale =
+          unname(par["scale"])
+      )
+    )
+  }
+
+
+  if (dist == "Burr12") {
+
+    cpar <-
+      unname(par["c"])
+
+    kpar <-
+      unname(par["k"])
+
+    scale <-
+      unname(par["scale"])
+
+    return(
+      1 -
+      (
+        1 +
+        (x / scale)^cpar
+      )^(-kpar)
+    )
+  }
+
+
+  if (dist == "GGamma") {
+
+    return(
+      flexsurv::pgengamma(
+        x,
+        mu =
+          unname(par["mu"]),
+        sigma =
+          unname(par["sigma"]),
+        Q =
+          unname(par["Q"])
+      )
+    )
+  }
+
+
+  if (dist == "GB2") {
+
+    return(
+      GB2::pgb2(
+        x,
+        shape1 =
+          unname(par["a"]),
+        scale =
+          unname(par["b"]),
+        shape2 =
+          unname(par["p"]),
+        shape3 =
+          unname(par["q"])
+      )
+    )
+  }
+
+}
+
+
+###############################################################
+## SECTION 9
+## Quantile functions for bootstrap
+###############################################################
+
+quantile_fit <- function(u, fit) {
+
+  par <-
+    fit$par
+
+  dist <-
+    fit$distribution
+
+
+  if (dist == "Lognormal") {
+
+    return(
+      qlnorm(
+        u,
+        meanlog =
+          unname(par["meanlog"]),
+        sdlog =
+          unname(par["sdlog"])
+      )
+    )
+  }
+
+
+  if (dist == "Gamma") {
+
+    return(
+      qgamma(
+        u,
+        shape =
+          unname(par["shape"]),
+        rate =
+          unname(par["rate"])
+      )
+    )
+  }
+
+
+  if (dist == "Weibull") {
+
+    return(
+      qweibull(
+        u,
+        shape =
+          unname(par["shape"]),
+        scale =
+          unname(par["scale"])
+      )
+    )
+  }
+
+
+  if (dist == "Burr12") {
+
+    cpar <-
+      unname(par["c"])
+
+    kpar <-
+      unname(par["k"])
+
+    scale <-
+      unname(par["scale"])
+
+    return(
+      scale *
+      (
+        (1 - u)^(-1 / kpar) -
+        1
+      )^(1 / cpar)
+    )
+  }
+
+
+  if (dist == "GGamma") {
+
+    return(
+      flexsurv::qgengamma(
+        u,
+        mu =
+          unname(par["mu"]),
+        sigma =
+          unname(par["sigma"]),
+        Q =
+          unname(par["Q"])
+      )
+    )
+  }
+
+
+  if (dist == "GB2") {
+
+    return(
+      GB2::qgb2(
+        u,
+        shape1 =
+          unname(par["a"]),
+        scale =
+          unname(par["b"]),
+        shape2 =
+          unname(par["p"]),
+        shape3 =
+          unname(par["q"])
+      )
+    )
+  }
+
+}
+
+
+###############################################################
+## SECTION 10
+## Anderson-Darling statistic
+###############################################################
+
+AD_statistic <- function(x, fit) {
+
+  x <-
+    sort(
+      as.numeric(x)
+    )
+
+  n <-
+    length(x)
+
+  Fval <-
+    cdf_fit(
+      x,
+      fit
+    )
+
+  eps <-
+    1e-12
+
+  Fval <-
+    pmin(
+      pmax(
+        Fval,
+        eps
+      ),
+      1 - eps
+    )
+
+  i <-
+    1:n
+
+  AD <-
+    -n -
+    mean(
+      (2 * i - 1) *
+      (
+        log(Fval) +
+        log(
+          1 -
+          rev(Fval)
+        )
+      )
+    )
+
+  AD
+}
+
+
+###############################################################
+## SECTION 11
+## Parametric bootstrap AD test
+###############################################################
+
+AD_bootstrap <- function(
+  x,
+  dist,
+  B = 100,
+  seed = 12345
+) {
+
+  set.seed(seed)
+
+  x <-
+    as.numeric(x)
+
+  x <-
+    x[
+      is.finite(x) &
+      x > 0
+    ]
+
+  fit0 <-
+    fit_positive_distribution(
+      x,
+      dist
+    )
+
+  AD_obs <-
+    AD_statistic(
+      x,
+      fit0
+    )
+
+  AD_boot <-
+    numeric(B)
+
+  success <-
+    0
+
+  attempts <-
+    0
+
+  max_attempts <-
+    5 * B
+
+
+  while (
+    success < B &&
+    attempts < max_attempts
+  ) {
+
+    attempts <-
+      attempts + 1
+
+
+    u <-
+      runif(
+        length(x),
+        min = 1e-8,
+        max = 1 - 1e-8
+      )
+
+
+    xb <-
+      try(
+        quantile_fit(
+          u,
+          fit0
+        ),
+        silent = TRUE
+      )
+
+
+    if (
+      inherits(
+        xb,
+        "try-error"
+      ) ||
+      any(!is.finite(xb)) ||
+      any(xb <= 0)
+    ) {
+      next
+    }
+
+
+    fitb <-
+      try(
+        fit_positive_distribution(
+          xb,
+          dist
+        ),
+        silent = TRUE
+      )
+
+
+    if (
+      inherits(
+        fitb,
+        "try-error"
+      )
+    ) {
+      next
+    }
+
+
+    if (
+      fitb$convergence != 0 ||
+      !is.finite(fitb$logLik) ||
+      fitb$logLik <= -1e90
+    ) {
+      next
+    }
+
+
+    adb <-
+      try(
+        AD_statistic(
+          xb,
+          fitb
+        ),
+        silent = TRUE
+      )
+
+
+    if (
+      inherits(
+        adb,
+        "try-error"
+      ) ||
+      !is.finite(adb)
+    ) {
+      next
+    }
+
+
+    success <-
+      success + 1
+
+    AD_boot[success] <-
+      adb
+  }
+
+
+  if (success == 0) {
+
+    stop(
+      "No successful bootstrap samples."
+    )
+
+  }
+
+
+  AD_boot <-
+    AD_boot[
+      1:success
+    ]
+
+
+  pvalue <-
+    (
+      1 +
+      sum(
+        AD_boot >= AD_obs
+      )
+    ) /
+    (
+      success + 1
+    )
+
+
+  list(
+
+    Distribution =
+      dist,
+
+    AD =
+      AD_obs,
+
+    p_value =
+      pvalue,
+
+    Successful_B =
+      success,
+
+    Failed =
+      attempts - success,
+
+    fit =
+      fit0
+
+  )
+}
+
+
+###############################################################
+## SECTION 12
+## Run AD bootstrap for all distributions
+###############################################################
+
+AD_all <- function(
+  x,
+  B = 100,
+  seed = 1000
+) {
+
+  dists <- c(
+    "Lognormal",
+    "Gamma",
+    "Weibull",
+    "Burr12",
+    "GGamma",
+    "GB2"
+  )
+
+  res <-
+    vector(
+      "list",
+      length(dists)
+    )
+
+  names(res) <-
+    dists
+
+
+  for (
+    j in seq_along(dists)
+  ) {
+
+    cat(
+      "\nRunning:",
+      dists[j],
+      "\n"
+    )
+
+    res[[j]] <-
+      AD_bootstrap(
+        x,
+        dist = dists[j],
+        B = B,
+        seed = seed + j
+      )
+  }
+
+
+  tab <-
+    do.call(
+      rbind,
+      lapply(
+        res,
+        function(z) {
+
+          data.frame(
+
+            Distribution =
+              z$Distribution,
+
+            AD =
+              z$AD,
+
+            AD_pvalue =
+              z$p_value,
+
+            Successful_B =
+              z$Successful_B,
+
+            Failed =
+              z$Failed
+          )
+        }
+      )
+    )
+
+
+  rownames(tab) <-
+    NULL
+
+
+  list(
+    results = res,
+    summary = tab
+  )
+}
+
+
+###############################################################
+## SECTION 13
+## Initial AD bootstrap with B = 100
+##
+## This section takes some time.
+###############################################################
+
+AD_atashsoozi <-
+  AD_all(
+    X$atashsoozi,
+    B = 100,
+    seed = 1000
+  )
+
+AD_mohandesi <-
+  AD_all(
+    X$mohandesi,
+    B = 100,
+    seed = 2000
+  )
+
+AD_masoliat <-
+  AD_all(
+    X$masoliat,
+    B = 100,
+    seed = 3000
+  )
+
+
+print(
+  AD_atashsoozi$summary
+)
+
+print(
+  AD_mohandesi$summary
+)
+
+print(
+  AD_masoliat$summary
+)
+
+
+###############################################################
+## SECTION 14
+## More accurate AD bootstrap for selected competitors
+## B = 1000
+##
+## This is the result we used for final selection.
+###############################################################
+
+AD_atash_GGamma <-
+  AD_bootstrap(
+    X$atashsoozi,
+    dist = "GGamma",
+    B = 1000,
+    seed = 11001
+  )
+
+
+AD_atash_Gamma <-
+  AD_bootstrap(
+    X$atashsoozi,
+    dist = "Gamma",
+    B = 1000,
+    seed = 11002
+  )
+
+
+AD_mohandesi_Gamma <-
+  AD_bootstrap(
+    X$mohandesi,
+    dist = "Gamma",
+    B = 1000,
+    seed = 12001
+  )
+
+
+AD_masoliat_Weibull <-
+  AD_bootstrap(
+    X$masoliat,
+    dist = "Weibull",
+    B = 1000,
+    seed = 13001
+  )
+
+
+AD_masoliat_GGamma <-
+  AD_bootstrap(
+    X$masoliat,
+    dist = "GGamma",
+    B = 1000,
+    seed = 13002
+  )
+
+
+AD_final_pvalues <- c(
+
+  Atash_GGamma =
+    AD_atash_GGamma$p_value,
+
+  Atash_Gamma =
+    AD_atash_Gamma$p_value,
+
+  Mohandesi_Gamma =
+    AD_mohandesi_Gamma$p_value,
+
+  Masoliat_Weibull =
+    AD_masoliat_Weibull$p_value,
+
+  Masoliat_GGamma =
+    AD_masoliat_GGamma$p_value
+
+)
+
+print(
+  AD_final_pvalues
+)
+
+
+###############################################################
+## SECTION 15
+## Selected marginal distributions
+##
+## X1 = Atashsoozi : Generalized Gamma
+## X2 = Mohandesi  : Gamma
+## X3 = Masoliat   : Weibull
+###############################################################
+
+fit_X1 <-
+  Fit_atashsoozi$fits$GGamma
+
+fit_X2 <-
+  Fit_mohandesi$fits$Gamma
+
+fit_X3 <-
+  Fit_masoliat$fits$Weibull
+
+
+###############################################################
+## SECTION 16
+## Display selected marginal parameters
+###############################################################
+
+cat(
+  "\nSelected parameters: Atashsoozi - GGamma\n"
+)
+
+print(
+  fit_X1$par
+)
+
+
+cat(
+  "\nSelected parameters: Mohandesi - Gamma\n"
+)
+
+print(
+  fit_X2$par
+)
+
+
+cat(
+  "\nSelected parameters: Masoliat - Weibull\n"
+)
+
+print(
+  fit_X3$par
+)
+
+
+###############################################################
+## SECTION 17
+## Probability Integral Transform
+##
+## U1 = F1(X1)
+## U2 = F2(X2)
+## U3 = F3(X3)
+###############################################################
+
+
+###############################################################
+## U1: Atashsoozi ~ Generalized Gamma
+###############################################################
+
+par1 <-
+  fit_X1$par
+
+U1 <-
+  flexsurv::pgengamma(
+    X$atashsoozi,
+    mu =
+      unname(par1["mu"]),
+    sigma =
+      unname(par1["sigma"]),
+    Q =
+      unname(par1["Q"])
+  )
+
+
+###############################################################
+## U2: Mohandesi ~ Gamma
+###############################################################
+
+par2 <-
+  fit_X2$par
+
+U2 <-
+  pgamma(
+    X$mohandesi,
+    shape =
+      unname(par2["shape"]),
+    rate =
+      unname(par2["rate"])
+  )
+
+
+###############################################################
+## U3: Masoliat ~ Weibull
+###############################################################
+
+par3 <-
+  fit_X3$par
+
+U3 <-
+  pweibull(
+    X$masoliat,
+    shape =
+      unname(par3["shape"]),
+    scale =
+      unname(par3["scale"])
+  )
+
+
+###############################################################
+## Construct U data
+###############################################################
+
+U <-
+  data.frame(
+    U1 = U1,
+    U2 = U2,
+    U3 = U3
+  )
+
+
+###############################################################
+## PIT checks
+###############################################################
+
+print(U)
+
+summary(U)
+
+apply(
+  U,
+  2,
+  range
+)
+
+any(U <= 0)
+
+any(U >= 1)
+
+
+###############################################################
+## SECTION 18
+## Dependence diagnostics
+###############################################################
+
+Umat <-
+  as.matrix(U)
+
+
+###############################################################
+## Pearson
+###############################################################
+
+Pearson_cor <-
+  cor(
+    Umat,
+    method = "pearson"
+  )
+
+print(
+  Pearson_cor
+)
+
+
+###############################################################
+## Spearman
+###############################################################
+
+Spearman_cor <-
+  cor(
+    Umat,
+    method = "spearman"
+  )
+
+print(
+  Spearman_cor
+)
+
+
+###############################################################
+## Kendall
+###############################################################
+
+Kendall_cor <-
+  cor(
+    Umat,
+    method = "kendall"
+  )
+
+print(
+  Kendall_cor
+)
+
+
+###############################################################
+## Pairwise Kendall tests
+###############################################################
+
+Kendall_12 <-
+  cor.test(
+    U$U1,
+    U$U2,
+    method = "kendall",
+    exact = FALSE
+  )
+
+Kendall_13 <-
+  cor.test(
+    U$U1,
+    U$U3,
+    method = "kendall",
+    exact = FALSE
+  )
+
+Kendall_23 <-
+  cor.test(
+    U$U2,
+    U$U3,
+    method = "kendall",
+    exact = FALSE
+  )
+
+
+print(
+  Kendall_12
+)
+
+print(
+  Kendall_13
+)
+
+print(
+  Kendall_23
+)
+
+
+###############################################################
+###############################################################
+##
+## SECTION 19
+## THREE-DIMENSIONAL BERNSTEIN COPULA
+## m = 2
+##
+###############################################################
+###############################################################
+
+
+###############################################################
+## 19.1 States of (N1,N2,N3)
+###############################################################
+
+m <- 2
+
+states <-
+  expand.grid(
+    N1 = 0:(m - 1),
+    N2 = 0:(m - 1),
+    N3 = 0:(m - 1)
+  )
+
+print(
+  states
+)
+
+
+###############################################################
+## 19.2 Bernstein component density
+##
+## For m = 2:
+##
+## U_i | N_i = nu_i
+## ~ Beta(nu_i + 1, m - nu_i)
+###############################################################
+
+component_density_m2 <-
+  function(
+    u,
+    state
+  ) {
+
+    d1 <-
+      dbeta(
+        u[1],
+        shape1 =
+          state[1] + 1,
+        shape2 =
+          2 - state[1]
+      )
+
+    d2 <-
+      dbeta(
+        u[2],
+        shape1 =
+          state[2] + 1,
+        shape2 =
+          2 - state[2]
+      )
+
+    d3 <-
+      dbeta(
+        u[3],
+        shape1 =
+          state[3] + 1,
+        shape2 =
+          2 - state[3]
+      )
+
+    d1 * d2 * d3
+  }
+
+
+###############################################################
+## 19.3 Matrix of component densities
+###############################################################
+
+n <-
+  nrow(Umat)
+
+D <-
+  matrix(
+    0,
+    nrow = n,
+    ncol = nrow(states)
+  )
+
+
+for (
+  t in 1:n
+) {
+
+  for (
+    r in 1:nrow(states)
+  ) {
+
+    D[t, r] <-
+      component_density_m2(
+        Umat[t, ],
+        as.numeric(
+          states[r, ]
+        )
+      )
+
+  }
+
+}
+
+
+print(
+  dim(D)
+)
+
+
+###############################################################
+## SECTION 20
+## Copula constraints
+##
+## gamma >= 0
+##
+## sum gamma = 1
+##
+## Marginals of each N_i are Uniform{0,1}
+###############################################################
+
+Aeq <-
+  matrix(
+    0,
+    nrow = 4,
+    ncol = 8
+  )
+
+
+## Total probability
+Aeq[1, ] <-
+  1
+
+
+## P(N1 = 0) = 0.5
+Aeq[2, ] <-
+  as.numeric(
+    states$N1 == 0
+  )
+
+
+## P(N2 = 0) = 0.5
+Aeq[3, ] <-
+  as.numeric(
+    states$N2 == 0
+  )
+
+
+## P(N3 = 0) = 0.5
+Aeq[4, ] <-
+  as.numeric(
+    states$N3 == 0
+  )
+
+
+beq <-
+  c(
+    1,
+    0.5,
+    0.5,
+    0.5
+  )
+
+
+###############################################################
+## SECTION 21
+## Bernstein copula negative log-likelihood
+###############################################################
+
+negloglik_gamma <-
+  function(gamma) {
+
+    dens <-
+      as.vector(
+        D %*% gamma
+      )
+
+    if (
+      any(dens <= 0) ||
+      any(!is.finite(dens))
+    ) {
+
+      return(1e100)
+
+    }
+
+    -sum(
+      log(dens)
+    )
+  }
+
+
+###############################################################
+## SECTION 22
+## Equality constraints
+###############################################################
+
+heq_gamma <-
+  function(gamma) {
+
+    as.vector(
+      Aeq %*%
+      gamma -
+      beq
+    )
+
+  }
+
+
+###############################################################
+## SECTION 23
+## Inequality constraints
+##
+## gamma >= 0
+###############################################################
+
+hin_gamma <-
+  function(gamma) {
+
+    gamma
+
+  }
+
+
+###############################################################
+## SECTION 24
+## Initial values
+##
+## Independence:
+## gamma = 1/8
+###############################################################
+
+gamma0 <-
+  rep(
+    1 / 8,
+    8
+  )
+
+
+###############################################################
+## SECTION 25
+## Fit Bernstein copula m = 2
+###############################################################
+
+fit_Bernstein_m2 <-
+  alabama::constrOptim.nl(
+
+    par =
+      gamma0,
+
+    fn =
+      negloglik_gamma,
+
+    heq =
+      heq_gamma,
+
+    hin =
+      hin_gamma,
+
+    control.outer =
+      list(
+        trace = FALSE,
+        method = "BFGS"
+      )
+
+  )
+
+
+###############################################################
+## SECTION 26
+## Estimated gamma
+###############################################################
+
+gamma_hat <-
+  fit_Bernstein_m2$par
+
+
+Gamma_table <-
+  cbind(
+    states,
+    gamma =
+      gamma_hat
+  )
+
+
+cat(
+  "\nEstimated Bernstein weights\n"
+)
+
+print(
+  Gamma_table
+)
+
+
+###############################################################
+## SECTION 27
+## Check Bernstein constraints
+###############################################################
+
+cat(
+  "\nSum of gamma:\n"
+)
+
+print(
+  sum(gamma_hat)
+)
+
+
+cat(
+  "\nMarginal distribution of N1:\n"
+)
+
+print(
+  tapply(
+    gamma_hat,
+    states$N1,
+    sum
+  )
+)
+
+
+cat(
+  "\nMarginal distribution of N2:\n"
+)
+
+print(
+  tapply(
+    gamma_hat,
+    states$N2,
+    sum
+  )
+)
+
+
+cat(
+  "\nMarginal distribution of N3:\n"
+)
+
+print(
+  tapply(
+    gamma_hat,
+    states$N3,
+    sum
+  )
+)
+
+
+cat(
+  "\nMinimum gamma:\n"
+)
+
+print(
+  min(gamma_hat)
+)
+
+
+###############################################################
+## SECTION 28
+## Bernstein copula log-likelihood
+###############################################################
+
+logLik_Bernstein_m2 <-
+  -negloglik_gamma(
+    gamma_hat
+  )
+
+
+cat(
+  "\nBernstein m=2 log-likelihood:\n"
+)
+
+print(
+  logLik_Bernstein_m2
+)
+
+
+###############################################################
+## SECTION 29
+## Simulation from fitted Bernstein copula
+###############################################################
+
+rBernstein_m2 <-
+  function(
+    B,
+    gamma_hat,
+    states
+  ) {
+
+    component <-
+      sample(
+        1:nrow(states),
+        size = B,
+        replace = TRUE,
+        prob = gamma_hat
+      )
+
+
+    Usim <-
+      matrix(
+        NA_real_,
+        nrow = B,
+        ncol = 3
+      )
+
+
+    for (
+      b in 1:B
+    ) {
+
+      st <-
+        states[
+          component[b],
+        ]
+
+
+      Usim[b, 1] <-
+        rbeta(
+          1,
+          shape1 =
+            st$N1 + 1,
+          shape2 =
+            2 - st$N1
+        )
+
+
+      Usim[b, 2] <-
+        rbeta(
+          1,
+          shape1 =
+            st$N2 + 1,
+          shape2 =
+            2 - st$N2
+        )
+
+
+      Usim[b, 3] <-
+        rbeta(
+          1,
+          shape1 =
+            st$N3 + 1,
+          shape2 =
+            2 - st$N3
+        )
+
+    }
+
+
+    colnames(Usim) <-
+      c(
+        "U1",
+        "U2",
+        "U3"
+      )
+
+
+    Usim
+  }
+
+
+###############################################################
+## SECTION 30
+## Simulate from fitted copula
+###############################################################
+
+set.seed(12345)
+
+Usim <-
+  rBernstein_m2(
+    B = 1000,
+    gamma_hat = gamma_hat,
+    states = states
+  )
+
+
+###############################################################
+## SECTION 31
+## Compare fitted dependence with empirical dependence
+###############################################################
+
+cat(
+  "\nEMPIRICAL KENDALL MATRIX\n"
+)
+
+print(
+  Kendall_cor
+)
+
+
+cat(
+  "\nBERNSTEIN m=2 KENDALL MATRIX\n"
+)
+
+Kendall_Bernstein_m2 <-
+  cor(
+    Usim,
+    method = "kendall"
+  )
+
+print(
+  Kendall_Bernstein_m2
+)
+
+
+cat(
+  "\nEMPIRICAL SPEARMAN MATRIX\n"
+)
+
+print(
+  Spearman_cor
+)
+
+
+cat(
+  "\nBERNSTEIN m=2 SPEARMAN MATRIX\n"
+)
+
+Spearman_Bernstein_m2 <-
+  cor(
+    Usim,
+    method = "spearman"
+  )
+
+print(
+  Spearman_Bernstein_m2
+)
+
+
+###############################################################
+## SECTION 32
+## Important final outputs
+###############################################################
+
+cat(
+  "\n=============================================\n"
+)
+
+cat(
+  "FINAL IMPORTANT OUTPUTS\n"
+)
+
+cat(
+  "=============================================\n"
+)
+
+
+cat(
+  "\n1. Selected marginal parameters\n"
+)
+
+print(
+  fit_X1$par
+)
+
+print(
+  fit_X2$par
+)
+
+print(
+  fit_X3$par
+)
+
+
+cat(
+  "\n2. PIT summary\n"
+)
+
+print(
+  summary(U)
+)
+
+
+cat(
+  "\n3. Bernstein weights\n"
+)
+
+print(
+  Gamma_table
+)
+
+
+cat(
+  "\n4. Bernstein log-likelihood\n"
+)
+
+print(
+  logLik_Bernstein_m2
+)
+
+
+cat(
+  "\n5. Empirical Kendall\n"
+)
+
+print(
+  Kendall_cor
+)
+
+
+cat(
+  "\n6. Fitted Bernstein Kendall\n"
+)
+
+print(
+  Kendall_Bernstein_m2
+)
+
+
+cat(
+  "\n7. Empirical Spearman\n"
+)
+
+print(
+  Spearman_cor
+)
+
+
+cat(
+  "\n8. Fitted Bernstein Spearman\n"
+)
+
+print(
+  Spearman_Bernstein_m2
+)
+
+
+###############################################################
+## END OF SCRIPT
+
+
+###############################################################
+###########################
+#################################
+##################################
+save.image(file="BR_insurance.RData")
+###################################
+########################################
+###################################
+
+Gamma_table
+
+logLik_Bernstein_m2
+
+Kendall_Bernstein_m2
+
+Spearman_Bernstein_m2
+
+#############################
+#m=2 براي داده ها کافي نيست 
+#######################
+###############################################################
+## Bernstein copula with m = 3
+###############################################################
+
+###############################################################
+## CORRECTED FIT OF 3-D BERNSTEIN COPULA
+## m = 3
+##
+## Equality constraints are eliminated analytically.
+###############################################################
+
+m <- 3
+
+states3 <- expand.grid(
+  N1 = 0:(m - 1),
+  N2 = 0:(m - 1),
+  N3 = 0:(m - 1)
+)
+
+K <- nrow(states3)       # 27
+n <- nrow(Umat)
+
+
+###############################################################
+## 1. Component-density matrix
+###############################################################
+
+D3 <- matrix(
+  0,
+  nrow = n,
+  ncol = K
+)
+
+for (t in 1:n) {
+
+  for (r in 1:K) {
+
+    nu <- as.numeric(states3[r, ])
+
+    D3[t, r] <-
+      prod(
+        dbeta(
+          Umat[t, ],
+          shape1 = nu + 1,
+          shape2 = m - nu
+        )
+      )
+  }
+}
+
+dim(D3)
+
+
+###############################################################
+## 2. Equality-constraint matrix
+###############################################################
+
+Aeq3 <- matrix(
+  0,
+  nrow = 7,
+  ncol = K
+)
+
+## Sum gamma = 1
+Aeq3[1, ] <- 1
+
+## N1 marginals
+Aeq3[2, ] <- as.numeric(states3$N1 == 0)
+Aeq3[3, ] <- as.numeric(states3$N1 == 1)
+
+## N2 marginals
+Aeq3[4, ] <- as.numeric(states3$N2 == 0)
+Aeq3[5, ] <- as.numeric(states3$N2 == 1)
+
+## N3 marginals
+Aeq3[6, ] <- as.numeric(states3$N3 == 0)
+Aeq3[7, ] <- as.numeric(states3$N3 == 1)
+
+beq3 <- c(
+  1,
+  rep(1/3, 6)
+)
+
+## Check rank
+qr(Aeq3)$rank
+
+###############################################################
+## 3. Null space of Aeq3 -- CORRECTED VERSION
+###############################################################
+
+## Full SVD: request all 27 right singular vectors
+sv <- svd(
+  Aeq3,
+  nu = 0,
+  nv = ncol(Aeq3)
+)
+
+## Check dimensions
+dim(sv$v)
+
+tol <- max(dim(Aeq3)) *
+       max(sv$d) *
+       .Machine$double.eps
+
+rankA <- sum(sv$d > tol)
+
+rankA
+
+Z <- sv$v[
+  ,
+  (rankA + 1):ncol(Aeq3),
+  drop = FALSE
+]
+
+dim(Z)
+
+############
+theta_to_gamma <- function(theta) {
+
+  as.vector(
+    gamma0_3 + Z %*% theta
+  )
+}
+
+###############################################################
+## 4. Independence is a feasible interior starting point
+###############################################################
+
+gamma0_3 <- rep(1/27, 27)
+
+Aeq3 %*% gamma0_3
+
+beq3
+
+###############################################################
+## 5. Convert theta to gamma
+###############################################################
+
+theta_to_gamma <- function(theta) {
+
+  as.vector(
+    gamma0_3 +
+    Z %*% theta
+  )
+}
+
+###############################################################
+## 6. Negative log-likelihood in free parameters
+###############################################################
+
+negloglik_theta3 <- function(theta) {
+
+  gamma <- theta_to_gamma(theta)
+
+  if (any(gamma < 0)) {
+    return(1e100)
+  }
+
+  dens <- as.vector(
+    D3 %*% gamma
+  )
+
+  if (
+    any(dens <= 0) ||
+    any(!is.finite(dens))
+  ) {
+    return(1e100)
+  }
+
+  -sum(log(dens))
+}
+
+
+###############################################################
+## 7. Inequality constraints
+##
+## gamma0 + Z theta >= 0
+###############################################################
+
+ui3 <- Z
+
+ci3 <- -gamma0_3
+###############################################################
+## 8. Constrained maximum likelihood
+###############################################################
+
+theta0 <- rep(
+  0,
+  ncol(Z)
+)
+
+fit_Bernstein_m3_v2 <- constrOptim(
+  theta = theta0,
+  f = negloglik_theta3,
+  grad = NULL,
+  ui = ui3,
+  ci = ci3,
+  method = "Nelder-Mead",
+  control = list(
+    maxit = 50000,
+    reltol = 1e-10
+  )
+)
+
+###############################################################
+## 9. Estimated Bernstein weights
+###############################################################
+
+theta_hat3 <- fit_Bernstein_m3_v2$par
+
+gamma_hat3_v2 <- theta_to_gamma(
+  theta_hat3
+)
+
+Gamma_table3_v2 <- cbind(
+  states3,
+  gamma = gamma_hat3_v2
+)
+
+Gamma_table3_v2
+###############################################################
+## 10. Checks
+###############################################################
+
+sum(gamma_hat3_v2)
+
+tapply(
+  gamma_hat3_v2,
+  states3$N1,
+  sum
+)
+
+tapply(
+  gamma_hat3_v2,
+  states3$N2,
+  sum
+)
+
+tapply(
+  gamma_hat3_v2,
+  states3$N3,
+  sum
+)
+
+min(gamma_hat3_v2)
+
+fit_Bernstein_m3_v2$convergence
+###############################################################
+## 11. Log-likelihood
+###############################################################
+
+logLik_Bernstein_m3_v2 <-
+  -negloglik_theta3(
+    theta_hat3
+  )
+
+logLik_Bernstein_m3_v2
+#################
+#نتيجه هنوز خوب نيست روش را تغيير ميدهيم
+##############################
+
+###############################################################
+## Gradient of negative log-likelihood for m = 3
+###############################################################
+
+grad_negloglik_theta3 <- function(theta) {
+
+  gamma <- theta_to_gamma(theta)
+
+  dens <- as.vector(D3 %*% gamma)
+
+  if (any(dens <= 0) ||
+      any(!is.finite(dens))) {
+
+    return(rep(NA_real_, length(theta)))
+  }
+
+  ## Gradient with respect to gamma
+  grad_gamma <-
+    -as.vector(
+      crossprod(
+        D3,
+        1 / dens
+      )
+    )
+
+  ## Chain rule:
+  ## gamma = gamma0 + Z theta
+  grad_theta <-
+    as.vector(
+      crossprod(
+        Z,
+        grad_gamma
+      )
+    )
+
+  grad_theta
+}
+
+###############################################################
+## REFIT m = 3 USING BFGS + analytical gradient
+###############################################################
+
+fit_Bernstein_m3_BFGS <- constrOptim(
+
+  theta = rep(0, ncol(Z)),
+
+  f = negloglik_theta3,
+
+  grad = grad_negloglik_theta3,
+
+  ui = Z,
+
+  ci = -gamma0_3,
+
+  method = "BFGS",
+
+  control = list(
+    maxit = 50000,
+    reltol = 1e-10
+  ),
+
+  outer.iterations = 200,
+  outer.eps = 1e-8
+)
+
+theta = rep(0, ncol(Z))
+
+###############################################################
+## Results
+###############################################################
+
+theta_hat3_BFGS <-
+  fit_Bernstein_m3_BFGS$par
+
+gamma_hat3_BFGS <-
+  theta_to_gamma(theta_hat3_BFGS)
+
+logLik_Bernstein_m3_BFGS <-
+  -negloglik_theta3(theta_hat3_BFGS)
+
+Gamma_table3_BFGS <-
+  cbind(
+    states3,
+    gamma = gamma_hat3_BFGS
+  )
+
+###############################################################
+## Simulate from fitted Bernstein copula with m = 3
+###############################################################
+
+rBernstein_general <- function(B, gamma_hat, states, m) {
+
+  component <- sample(
+    1:nrow(states),
+    size = B,
+    replace = TRUE,
+    prob = gamma_hat
+  )
+
+  Usim <- matrix(
+    NA_real_,
+    nrow = B,
+    ncol = 3
+  )
+
+  for (b in 1:B) {
+
+    st <- states[component[b], ]
+
+    Usim[b, 1] <- rbeta(
+      1,
+      shape1 = st$N1 + 1,
+      shape2 = m - st$N1
+    )
+
+    Usim[b, 2] <- rbeta(
+      1,
+      shape1 = st$N2 + 1,
+      shape2 = m - st$N2
+    )
+
+    Usim[b, 3] <- rbeta(
+      1,
+      shape1 = st$N3 + 1,
+      shape2 = m - st$N3
+    )
+  }
+
+  colnames(Usim) <- c("U1", "U2", "U3")
+
+  Usim
+}
+
+
+set.seed(12345)
+
+Usim3 <- rBernstein_general(
+  B = 100000,
+  gamma_hat = gamma_hat3_BFGS,
+  states = states3,
+  m = 3
+)
+
+
+Kendall_Bernstein_m3 <- cor(
+  Usim3,
+  method = "kendall"
+)
+
+Spearman_Bernstein_m3 <- cor(
+  Usim3,
+  method = "spearman"
+)
+
+Kendall_Bernstein_m3
+
+Spearman_Bernstein_m3
+
+###########################
+#################################
+##################################
+save.image(file="BR_insurance.RData")
+###################################
+########################################
+###################################
+
+###############################################################
+## SECTION 33
+## General Bernstein copula fitting function
+## For m = 2 or m = 3
+###############################################################
+
+fit_Bernstein_general <- function(Utrain, m) {
+
+  Utrain <- as.matrix(Utrain)
+
+  n <- nrow(Utrain)
+
+  states <- expand.grid(
+    N1 = 0:(m - 1),
+    N2 = 0:(m - 1),
+    N3 = 0:(m - 1)
+  )
+
+  K <- nrow(states)
+
+
+  #############################################################
+  ## Component-density matrix
+  #############################################################
+
+  D <- matrix(
+    0,
+    nrow = n,
+    ncol = K
+  )
+
+  for (r in 1:K) {
+
+    nu <- as.numeric(states[r, ])
+
+    D[, r] <-
+      dbeta(
+        Utrain[, 1],
+        shape1 = nu[1] + 1,
+        shape2 = m - nu[1]
+      ) *
+      dbeta(
+        Utrain[, 2],
+        shape1 = nu[2] + 1,
+        shape2 = m - nu[2]
+      ) *
+      dbeta(
+        Utrain[, 3],
+        shape1 = nu[3] + 1,
+        shape2 = m - nu[3]
+      )
+  }
+
+
+  #############################################################
+  ## Equality constraints
+  ##
+  ## sum gamma = 1
+  ## and first m-1 marginal probabilities for each dimension
+  #############################################################
+
+  nr <- 1 + 3 * (m - 1)
+
+  Aeq <- matrix(
+    0,
+    nrow = nr,
+    ncol = K
+  )
+
+  beq <- c(
+    1,
+    rep(1 / m, 3 * (m - 1))
+  )
+
+  Aeq[1, ] <- 1
+
+  row <- 2
+
+  for (j in 1:3) {
+
+    Nj <- states[[j]]
+
+    for (k in 0:(m - 2)) {
+
+      Aeq[row, ] <-
+        as.numeric(Nj == k)
+
+      row <- row + 1
+    }
+  }
+
+
+  #############################################################
+  ## Full SVD and null space
+  #############################################################
+
+  sv <- svd(
+    Aeq,
+    nu = 0,
+    nv = ncol(Aeq)
+  )
+
+  tol <-
+    max(dim(Aeq)) *
+    max(sv$d) *
+    .Machine$double.eps
+
+  rankA <-
+    sum(sv$d > tol)
+
+  Z <-
+    sv$v[
+      ,
+      (rankA + 1):ncol(Aeq),
+      drop = FALSE
+    ]
+
+
+  #############################################################
+  ## Independence starting point
+  #############################################################
+
+  gamma0 <-
+    rep(
+      1 / K,
+      K
+    )
+
+
+  #############################################################
+  ## theta -> gamma
+  #############################################################
+
+  theta_to_gamma_local <- function(theta) {
+
+    as.vector(
+      gamma0 +
+      Z %*% theta
+    )
+  }
+
+
+  #############################################################
+  ## Negative log-likelihood
+  #############################################################
+
+  negloglik <- function(theta) {
+
+    gamma <-
+      theta_to_gamma_local(theta)
+
+    if (any(gamma < 0)) {
+      return(1e100)
+    }
+
+    dens <-
+      as.vector(
+        D %*% gamma
+      )
+
+    if (
+      any(dens <= 0) ||
+      any(!is.finite(dens))
+    ) {
+      return(1e100)
+    }
+
+    -sum(log(dens))
+  }
+
+
+  #############################################################
+  ## Analytical gradient
+  #############################################################
+
+  grad_negloglik <- function(theta) {
+
+    gamma <-
+      theta_to_gamma_local(theta)
+
+    dens <-
+      as.vector(
+        D %*% gamma
+      )
+
+    if (
+      any(dens <= 0) ||
+      any(!is.finite(dens))
+    ) {
+      return(
+        rep(
+          NA_real_,
+          length(theta)
+        )
+      )
+    }
+
+    grad_gamma <-
+      -as.vector(
+        crossprod(
+          D,
+          1 / dens
+        )
+      )
+
+    as.vector(
+      crossprod(
+        Z,
+        grad_gamma
+      )
+    )
+  }
+
+
+  #############################################################
+  ## Optimization
+  #############################################################
+
+  theta0 <-
+    rep(
+      0,
+      ncol(Z)
+    )
+
+  fit <- constrOptim(
+    theta = theta0,
+    f = negloglik,
+    grad = grad_negloglik,
+    ui = Z,
+    ci = -gamma0,
+    method = "BFGS",
+    control = list(
+      maxit = 20000,
+      reltol = 1e-9
+    ),
+    outer.iterations = 100,
+    outer.eps = 1e-7
+  )
+
+
+  gamma_hat <-
+    theta_to_gamma_local(
+      fit$par
+    )
+
+
+  list(
+    gamma = gamma_hat,
+    states = states,
+    m = m,
+    logLik = -negloglik(fit$par),
+    convergence = fit$convergence
+  )
+}
+
+###############################################################
+## SECTION 34
+## Bernstein copula density at one observation
+###############################################################
+
+dBernstein_point <- function(
+  u,
+  gamma,
+  states,
+  m
+) {
+
+  K <- nrow(states)
+
+  component <- numeric(K)
+
+  for (r in 1:K) {
+
+    nu <- as.numeric(
+      states[r, ]
+    )
+
+    component[r] <-
+      dbeta(
+        u[1],
+        shape1 = nu[1] + 1,
+        shape2 = m - nu[1]
+      ) *
+      dbeta(
+        u[2],
+        shape1 = nu[2] + 1,
+        shape2 = m - nu[2]
+      ) *
+      dbeta(
+        u[3],
+        shape1 = nu[3] + 1,
+        shape2 = m - nu[3]
+      )
+  }
+
+  sum(
+    gamma * component
+  )
+}
+
+###############################################################
+## SECTION 35
+## Leave-One-Out Cross-Validation
+###############################################################
+
+LOOCV_Bernstein <- function(Umat, m) {
+
+  Umat <- as.matrix(Umat)
+
+  n <- nrow(Umat)
+
+  logscore <- rep(
+    NA_real_,
+    n
+  )
+
+  convergence <- rep(
+    NA_integer_,
+    n
+  )
+
+
+  for (i in 1:n) {
+
+    cat(
+      "m =", m,
+      "  left-out observation =", i,
+      "of", n, "\n"
+    )
+
+
+    Utrain <-
+      Umat[-i, , drop = FALSE]
+
+    utest <-
+      Umat[i, ]
+
+
+    fit_i <-
+      try(
+        fit_Bernstein_general(
+          Utrain,
+          m
+        ),
+        silent = TRUE
+      )
+
+
+    if (
+      inherits(
+        fit_i,
+        "try-error"
+      )
+    ) {
+
+      cat(
+        "   Fit failed.\n"
+      )
+
+      next
+    }
+
+
+    convergence[i] <-
+      fit_i$convergence
+
+
+    dens_i <-
+      dBernstein_point(
+        u = utest,
+        gamma = fit_i$gamma,
+        states = fit_i$states,
+        m = m
+      )
+
+
+    if (
+      is.finite(dens_i) &&
+      dens_i > 0
+    ) {
+
+      logscore[i] <-
+        log(dens_i)
+
+    }
+
+  }
+
+
+  list(
+
+    m = m,
+
+    logscore =
+      logscore,
+
+    total_logscore =
+      sum(
+        logscore,
+        na.rm = TRUE
+      ),
+
+    mean_logscore =
+      mean(
+        logscore,
+        na.rm = TRUE
+      ),
+
+    successful =
+      sum(
+        is.finite(logscore)
+      ),
+
+    convergence =
+      convergence
+  )
+}
+
+###############################################################
+## SECTION 36
+## LOOCV for m = 2
+###############################################################
+
+set.seed(12345)
+
+CV_m2 <- LOOCV_Bernstein(
+  Umat,
+  m = 2
+)
+
+
+fit_minus1 <- fit_Bernstein_general(
+  Umat[-1, , drop = FALSE],
+  m = 2
+)
+
+fit_minus10 <- fit_Bernstein_general(
+  Umat[-10, , drop = FALSE],
+  m = 2
+)
+
+fit_minus19 <- fit_Bernstein_general(
+  Umat[-19, , drop = FALSE],
+  m = 2
+)
+
+rbind(
+  full_sample = gamma_hat,
+  minus_1     = fit_minus1$gamma,
+  minus_10    = fit_minus10$gamma,
+  minus_19    = fit_minus19$gamma
+)
+
+
+###############################################################
+## SECTION 37
+## LOOCV for Bernstein copula m = 3
+###############################################################
+
+set.seed(12345)
+
+CV_m3 <- LOOCV_Bernstein(
+  Umat,
+  m = 3
+)
+
+###############################################################
+## Results of LOOCV for m = 3
+###############################################################
+
+CV_m3$total_logscore
+
+CV_m3$mean_logscore
+
+CV_m3$successful
+
+CV_m3$convergence
+
+CV_comparison <- data.frame(
+  m = c(2, 3),
+
+  Full_LogLik = c(
+    logLik_Bernstein_m2,
+    logLik_Bernstein_m3_BFGS
+  ),
+
+  LOOCV_Total = c(
+    CV_m2$total_logscore,
+    CV_m3$total_logscore
+  ),
+
+  LOOCV_Mean = c(
+    CV_m2$mean_logscore,
+    CV_m3$mean_logscore
+  ),
+
+  Successful = c(
+    CV_m2$successful,
+    CV_m3$successful
+  )
+)
+
+CV_comparison
+
+#########################
+###############################################################
+## SECTION 38
+## FAST simulation from fitted Bernstein copula, m = 2
+###############################################################
+
+rBernstein_m2_fast <- function(B, gamma_hat, states) {
+
+  ## Draw mixture component
+  comp <- sample.int(
+    n = nrow(states),
+    size = B,
+    replace = TRUE,
+    prob = gamma_hat
+  )
+
+  N1 <- states$N1[comp]
+  N2 <- states$N2[comp]
+  N3 <- states$N3[comp]
+
+  ## Conditional Beta draws
+  U1_sim <- rbeta(
+    B,
+    shape1 = N1 + 1,
+    shape2 = 2 - N1
+  )
+
+  U2_sim <- rbeta(
+    B,
+    shape1 = N2 + 1,
+    shape2 = 2 - N2
+  )
+
+  U3_sim <- rbeta(
+    B,
+    shape1 = N3 + 1,
+    shape2 = 2 - N3
+  )
+
+  data.frame(
+    U1 = U1_sim,
+    U2 = U2_sim,
+    U3 = U3_sim
+  )
+}
+
+###########################
+#################################
+##################################
+save.image(file="BR_insurance.RData")
+###################################
+########################################
+###################################
+
+
+set.seed(12345)
+
+Usim_m2 <- rBernstein_m2_fast(
+  B = 50000,
+  gamma_hat = gamma_hat,
+  states = states
+)
+
+###############################################################
+## SECTION 39
+## Return to original loss scale
+###############################################################
+
+## X1: Atashsoozi ~ Generalized Gamma
+X1_sim <- flexsurv::qgengamma(
+  Usim_m2$U1,
+  mu    = unname(fit_X1$par["mu"]),
+  sigma = unname(fit_X1$par["sigma"]),
+  Q     = unname(fit_X1$par["Q"])
+)
+
+## X2: Mohandesi ~ Gamma
+X2_sim <- qgamma(
+  Usim_m2$U2,
+  shape = unname(fit_X2$par["shape"]),
+  rate  = unname(fit_X2$par["rate"])
+)
+
+## X3: Masoliat ~ Weibull
+X3_sim <- qweibull(
+  Usim_m2$U3,
+  shape = unname(fit_X3$par["shape"]),
+  scale = unname(fit_X3$par["scale"])
+)
+
+###############################################################
+## SECTION 40
+## Aggregate loss
+###############################################################
+
+S_sim <- X1_sim + X2_sim + X3_sim
+
+###############################################################
+## SECTION 41
+## VaR and TVaR
+###############################################################
+
+risk_measures <- function(S, kappa = 0.95) {
+
+  VaR <- unname(
+    quantile(
+      S,
+      probs = kappa,
+      type = 8
+    )
+  )
+
+  tail_index <- S > VaR
+
+  TVaR <- mean(
+    S[tail_index]
+  )
+
+  c(
+    VaR  = VaR,
+    TVaR = TVaR
+  )
+}
+
+Risk_095 <- risk_measures(
+  S_sim,
+  kappa = 0.95
+)
+
+Risk_095
+#     VaR     TVaR 
+#10989949 12129665 
+
+
+Risk_099 <- risk_measures(
+  S_sim,
+  kappa = 0.99
+)
+
+Risk_099
+#     VaR     TVaR 
+#12871852 13868126 
+
+###############################################################
+## SECTION 42
+## TVaR capital allocation
+###############################################################
+
+TVaR_allocation <- function(
+  X1,
+  X2,
+  X3,
+  kappa = 0.95
+) {
+
+  S <- X1 + X2 + X3
+
+  VaR <- unname(
+    quantile(
+      S,
+      probs = kappa,
+      type = 8
+    )
+  )
+
+  tail_index <- S > VaR
+
+  TVaR_S <- mean(
+    S[tail_index]
+  )
+
+  TVaR_X1 <- mean(
+    X1[tail_index]
+  )
+
+  TVaR_X2 <- mean(
+    X2[tail_index]
+  )
+
+  TVaR_X3 <- mean(
+    X3[tail_index]
+  )
+
+  c(
+    VaR_S   = VaR,
+    TVaR_S  = TVaR_S,
+    TVaR_X1 = TVaR_X1,
+    TVaR_X2 = TVaR_X2,
+    TVaR_X3 = TVaR_X3,
+    Sum_alloc =
+      TVaR_X1 +
+      TVaR_X2 +
+      TVaR_X3
+  )
+}
+
+Allocation_095 <- TVaR_allocation(
+  X1_sim,
+  X2_sim,
+  X3_sim,
+  kappa = 0.95
+)
+
+Allocation_095
+#    VaR_S    TVaR_S   TVaR_X1   TVaR_X2   TVaR_X3 Sum_alloc 
+# 10989949  12129665   6011005   1447845   4670815  12129665 
+
+######### کنترل ############
+
+Allocation_095["TVaR_S"]
+
+Allocation_095["Sum_alloc"]
+
+Allocation_095["TVaR_S"] -
+  Allocation_095["Sum_alloc"]
+
+######### سهم درصدي هر رشته ############
+###############################################################
+## SECTION 43
+## Percentage contribution
+###############################################################
+
+allocation_percent <- 100 * c(
+  Atashsoozi =
+    Allocation_095["TVaR_X1"],
+
+  Mohandesi =
+    Allocation_095["TVaR_X2"],
+
+  Masoliat =
+    Allocation_095["TVaR_X3"]
+) /
+  Allocation_095["TVaR_S"]
+
+allocation_percent
+#Atashsoozi.TVaR_X1  Mohandesi.TVaR_X2   Masoliat.TVaR_X3 
+#          49.55623           11.93640           38.50737 
+
+########### کنترل ###########
+Marginal_check <- rbind(
+
+  Observed_Mean = c(
+    mean(X$atashsoozi),
+    mean(X$mohandesi),
+    mean(X$masoliat)
+  ),
+
+  Simulated_Mean = c(
+    mean(X1_sim),
+    mean(X2_sim),
+    mean(X3_sim)
+  ),
+
+  Observed_Median = c(
+    median(X$atashsoozi),
+    median(X$mohandesi),
+    median(X$masoliat)
+  ),
+
+  Simulated_Median = c(
+    median(X1_sim),
+    median(X2_sim),
+    median(X3_sim)
+  ),
+
+  Observed_Max = c(
+    max(X$atashsoozi),
+    max(X$mohandesi),
+    max(X$masoliat)
+  ),
+
+  Simulated_95pct = c(
+    quantile(X1_sim, 0.95),
+    quantile(X2_sim, 0.95),
+    quantile(X3_sim, 0.95)
+  )
+)
+
+colnames(Marginal_check) <- c(
+  "Atashsoozi",
+  "Mohandesi",
+  "Masoliat"
+)
+
+Marginal_check
+
+Aggregate_check <- rbind(
+
+  Observed = c(
+    Mean   = mean(S_obs),
+    Median = median(S_obs),
+    SD     = sd(S_obs),
+    Q90    = quantile(S_obs, 0.90),
+    Q95    = quantile(S_obs, 0.95),
+    Max    = max(S_obs)
+  ),
+
+  Simulated = c(
+    Mean   = mean(S_sim),
+    Median = median(S_sim),
+    SD     = sd(S_sim),
+    Q90    = quantile(S_sim, 0.90),
+    Q95    = quantile(S_sim, 0.95),
+    Max    = max(S_sim)
+  )
+)
+
+Aggregate_check
+
+
+
+save.image(file="BR_insurance.RData")
