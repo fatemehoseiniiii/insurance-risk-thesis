@@ -1,0 +1,202 @@
+## ============================================================
+## FULL R CODE (Tables 1–2, all cases) — replication-averaged
+## This version is designed to reproduce the monotone patterns
+## reliably by averaging over R independent runs per (m,case).
+##
+## Key corrections:
+##  1) Theta ~ Gamma(shape=a, rate=b)  (NOT scale=b)
+##  2) Wi = D_{m-nu : m} for Exp(1) via spacings
+##  3) gamma_{nu1,nu2} from 2D finite differences of alpha on grid
+##  4) TVaR uses event S2 > VaR
+## ============================================================
+
+if (!requireNamespace("copula", quietly = TRUE)) install.packages("copula")
+library(copula)
+
+## -----------------------------
+## Global parameters
+## -----------------------------
+a     <- 5
+b     <- 100
+kappa <- 0.95
+m_list <- c(1, 5, 10, 20, 30, 40, 50)
+
+## Monte Carlo controls
+## Use larger Nsim for Table 2 case (i) if you want very stable monotonicity
+Nsim_table1 <- 5000
+Nsim_table2 <- 10000
+Rrep        <- 10   # number of independent replications to average
+
+## -----------------------------
+## Alpha functions
+## -----------------------------
+alpha_comonotonic <- function(u, v) pmin(u, v)
+alpha_counter     <- function(u, v) pmax(u + v - 1, 0)
+
+alpha_piecewise_gauss <- function(tau = 0.5, r1 = -0.95, r2 = 0.95) {
+  C1 <- normalCopula(param = r1, dim = 2, dispstr = "un")
+  C2 <- normalCopula(param = r2, dim = 2, dispstr = "un")
+  function(u, v) {
+    out <- numeric(length(u))
+    idx <- (u <= tau)
+    if (any(idx)) {
+      out[idx] <- tau * pCopula(cbind(u[idx] / tau, v[idx]), C1)
+    }
+    if (any(!idx)) {
+      out[!idx] <- tau * v[!idx] +
+        (1 - tau) * pCopula(cbind((u[!idx] - tau) / (1 - tau), v[!idx]), C2)
+    }
+    out
+  }
+}
+
+alpha_liebscher <- function(gamma = 6, delta = 2, theta1 = 0.525, theta2 = 0.3) {
+  function(u, v) {
+    part1 <- (1 + (u^(-gamma * theta1) - 1) + (v^(-gamma * theta2) - 1))^(-1/gamma)
+    part2 <- (1 + (u^(-delta * (1 - theta1)) - 1) + (v^(-delta * (1 - theta2)) - 1))^(-1/delta)
+    part1 * part2
+  }
+}
+
+## -----------------------------
+## gamma from alpha (n=2): finite differences
+## gamma_{nu1,nu2} = alpha(u0,v0) - alpha(u1,v0) - alpha(u0,v1) + alpha(u1,v1)
+## -----------------------------
+gamma_from_alpha <- function(m, alpha_fun) {
+  g <- matrix(0, m, m)
+  for (nu1 in 0:(m - 1)) for (nu2 in 0:(m - 1)) {
+    u0 <- nu1 / m; u1 <- (nu1 + 1) / m
+    v0 <- nu2 / m; v1 <- (nu2 + 1) / m
+    g[nu1 + 1, nu2 + 1] <- alpha_fun(u0, v0) - alpha_fun(u1, v0) - alpha_fun(u0, v1) + alpha_fun(u1, v1)
+  }
+  g[g < 0 & g > -1e-14] <- 0
+  if (any(g < 0)) stop("gamma has negative masses beyond tolerance. Check alpha validity.")
+  s <- sum(g)
+  if (s <= 0) stop("gamma sums to 0. Check alpha validity.")
+  g / s
+}
+
+## -----------------------------
+## Wi = D_{m-nu:m} for Exp(1) via spacings
+## If Y_(k) is k-th smallest of m Exp(1):
+##   Y_(k) = sum_{j=0}^{k-1} E_j / (m - j),  E_j ~ Exp(1)
+## Here k = m - nu
+## -----------------------------
+precompute_rates <- function(m) {
+  lapply(0:(m - 1), function(nu) {
+    k <- m - nu
+    m:(m - k + 1)  # m, m-1, ..., nu+1
+  })
+}
+
+r_W_fast <- function(rates_list, nu) {
+  rates <- rates_list[[nu + 1]]
+  sum(rexp(length(rates), rate = rates))
+}
+
+## -----------------------------
+## One draw (X1, X2, S2)
+## -----------------------------
+r_one <- function(m, gamma_mat, rates_list, a, b) {
+  idx <- sample.int(m * m, 1, prob = as.vector(gamma_mat))
+  nu1 <- (idx - 1) %% m
+  nu2 <- (idx - 1) %/% m
+
+  w1 <- r_W_fast(rates_list, nu1)
+  w2 <- r_W_fast(rates_list, nu2)
+
+  theta <- rgamma(1, shape = a, rate = b)  # IMPORTANT: rate=b
+  x1 <- w1 / theta
+  x2 <- w2 / theta
+  c(x1 = x1, x2 = x2, s2 = x1 + x2)
+}
+
+## -----------------------------
+## One-run estimator for a fixed (m, alpha)
+## -----------------------------
+estimate_once <- function(m, alpha_fun, kappa, a, b, Nsim, seed) {
+  set.seed(seed)
+  gamma_mat  <- gamma_from_alpha(m, alpha_fun)
+  rates_list <- precompute_rates(m)
+
+  X <- t(replicate(Nsim, r_one(m, gamma_mat, rates_list, a, b)))
+  s2 <- X[, "s2"]
+
+  VaR <- unname(quantile(s2, probs = kappa, type = 8))
+  tail <- (s2 > VaR)  # strict >
+
+  TVaR_S2 <- mean(s2[tail])
+  TVaR_X1 <- mean(X[tail, "x1"])
+  TVaR_X2 <- mean(X[tail, "x2"])
+
+  c(m = m, VaR = VaR, TVaR = TVaR_S2, TVaR_X1 = TVaR_X1, TVaR_X2 = TVaR_X2)
+}
+
+## -----------------------------
+## Replication-averaged estimator (recommended)
+## -----------------------------
+estimate_avg <- function(m, alpha_fun, kappa, a, b, Nsim, Rrep, seed0 = 1) {
+  reps <- replicate(Rrep, {
+    seed0 <- seed0 + 1
+    estimate_once(m, alpha_fun, kappa, a, b, Nsim, seed = seed0)
+  })
+  reps <- t(reps)              # Rrep x 5
+  colMeans(reps)
+}
+
+## ============================================================
+## TABLE 1 (Example 6.1): cases (i) and (ii)
+## ============================================================
+run_table1_all <- function(Nsim = Nsim_table1, Rrep = Rrep) {
+
+  tab_i <- do.call(rbind, lapply(m_list, function(mm) {
+    estimate_avg(mm, alpha_comonotonic, kappa, a, b, Nsim, Rrep, seed0 = 10000 + mm)
+  }))
+
+  tab_ii <- do.call(rbind, lapply(m_list, function(mm) {
+    estimate_avg(mm, alpha_counter, kappa, a, b, Nsim, Rrep, seed0 = 20000 + mm)
+  }))
+
+  cat("\nTABLE 1 — Example 6.1 (i) Comonotonic (should increase with m)\n")
+  print(round(tab_i[, c("m", "VaR", "TVaR")], 2))
+
+  cat("\nTABLE 1 — Example 6.1 (ii) Counter-comonotonic (should decrease with m)\n")
+  print(round(tab_ii[, c("m", "VaR", "TVaR")], 2))
+
+  invisible(list(case_i = tab_i, case_ii = tab_ii))
+}
+
+## ============================================================
+## TABLE 2 (Example 6.2): cases (i) and (ii)
+## ============================================================
+run_table2_all <- function(Nsim = Nsim_table2, Rrep = Rrep) {
+
+  alpha_pw <- alpha_piecewise_gauss(tau = 0.5, r1 = -0.95, r2 = 0.95)
+  alpha_lb <- alpha_liebscher(gamma = 6, delta = 2, theta1 = 0.525, theta2 = 0.3)
+
+  tab_i <- do.call(rbind, lapply(m_list, function(mm) {
+    estimate_avg(mm, alpha_pw, kappa, a, b, Nsim, Rrep, seed0 = 30000 + mm)
+  }))
+
+  tab_ii <- do.call(rbind, lapply(m_list, function(mm) {
+    estimate_avg(mm, alpha_lb, kappa, a, b, Nsim, Rrep, seed0 = 40000 + mm)
+  }))
+
+  cat("\nTABLE 2 — Example 6.2 (i) Piecewise Gaussian\n")
+  print(round(tab_i[, c("m", "VaR", "TVaR", "TVaR_X1", "TVaR_X2")], 2))
+
+  cat("\nTABLE 2 — Example 6.2 (ii) Liebscher-type\n")
+  print(round(tab_ii[, c("m", "VaR", "TVaR", "TVaR_X1", "TVaR_X2")], 2))
+
+  invisible(list(case_i = tab_i, case_ii = tab_ii))
+}
+
+## ============================================================
+## RUN ALL CASES (Tables 1 and 2)
+## ============================================================
+#res_table1 <- run_table1_all(Nsim = Nsim_table1, Rrep = Rrep)
+#res_table2 <- run_table2_all(Nsim = Nsim_table2, Rrep = Rrep)
+
+res_table1 <- run_table1_all(Nsim = 1000, Rrep = Rrep)
+###
+res_table2 <- run_table2_all(Nsim = 1000, Rrep = Rrep)
